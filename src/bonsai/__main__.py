@@ -1,7 +1,6 @@
 """The `bonsai` command line."""
 
 import argparse
-import os
 import sqlite3
 import sys
 from contextlib import nullcontext
@@ -10,11 +9,14 @@ from pathlib import Path
 
 import httpx
 
-from bonsai import overrides
+from bonsai import overrides, paths, report
 from bonsai.build import build
 from bonsai.cache import Cache
+from bonsai.pruning import prune
 from bonsai.refresh import refresh_game, refresh_market
+from bonsai.rules import Rules
 from bonsai.sources import datamining, teamcraft, universalis
+from bonsai.tree import Tree
 
 DEFAULT_SCOPE = "Japan"
 
@@ -25,6 +27,9 @@ def main(argv: list[str] | None = None, client: httpx.Client | None = None) -> i
     try:
         if args.command == "status":
             _status(cache)
+            return 0
+        if args.command == "prune":
+            _prune(cache, args.rules, args.show)
             return 0
         if args.command == "refresh":
             with nullcontext(client) if client else _client() as http:
@@ -53,7 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache-dir",
         type=Path,
-        default=_default_cache_dir(),
+        default=paths.cache_dir(),
         help="where the sources and the tree are kept (default: %(default)s)",
     )
     commands = parser.add_subparsers(dest="command", required=True)
@@ -68,25 +73,26 @@ def _parser() -> argparse.ArgumentParser:
     )
     commands.add_parser("build", help="rebuild the tree from the cache, offline")
     commands.add_parser("status", help="show what the cache holds")
+    prune = commands.add_parser("prune", help="keep what the rules select")
+    prune.add_argument(
+        "--rules",
+        type=Path,
+        default=Path("rules.toml"),
+        help="the rules file (default: %(default)s)",
+    )
+    prune.add_argument(
+        "--show", choices=["kept", "hoard"], help="list the kept recipes or the hoard"
+    )
     return parser
-
-
-def _default_cache_dir() -> Path:
-    return _xdg("XDG_CACHE_HOME", ".cache") / "bonsai-xiv"
 
 
 def _override_files() -> list[Path]:
     """The shared overrides, then the personal ones: those that exist."""
     files = [
         Path("overrides.toml"),
-        _xdg("XDG_CONFIG_HOME", ".config") / "bonsai-xiv" / "overrides.toml",
+        paths.config_dir() / "overrides.toml",
     ]
     return [path for path in files if path.exists()]
-
-
-def _xdg(variable: str, default: str) -> Path:
-    directory = os.environ.get(variable)
-    return Path(directory) if directory else Path.home() / default
 
 
 def _client() -> httpx.Client:
@@ -114,6 +120,38 @@ def _market_status(cache: Cache) -> str:
         return "not fetched"
     meta = universalis.meta(cache.directory(universalis.NAME, market))
     return f"{meta['market_scope']}, fetched at {meta['market_fetched_at']}"
+
+
+def _prune(cache: Cache, rules_file: Path, show: str | None) -> None:
+    if not rules_file.exists():
+        raise RuntimeError(f"no rules file {rules_file}: see docs/pruning.md")
+    if not cache.database.exists():
+        raise RuntimeError("no tree: run `bonsai refresh game` first")
+    tree = Tree.load(cache.database)
+    pruning = prune(tree, Rules.load(rules_file))
+    totals = report.summary(tree, pruning)
+    width = max((len(name) for name in totals["rules"]), default=0)
+    for name, count in totals["rules"].items():
+        print(f"{name:<{width}}  {count} selected")
+    print(
+        f"kept {totals['kept']} recipes of {totals['recipes']},"
+        f" pruned {totals['pruned']}; {totals['hoard']} base ingredients to hoard"
+    )
+    if show == "hoard":
+        rows = [
+            (row["name"], f"needed by {row['needed by']}", row["sources"])
+            for row in report.hoard(tree, pruning)
+        ]
+    elif show == "kept":
+        rows = [
+            (row["name"], f"{row['job']} {row['level']}", row["why"])
+            for row in report.kept(tree, pruning)
+        ]
+    else:
+        rows = []
+    widths = [max((len(row[i]) for row in rows), default=0) for i in range(2)]
+    for first, second, third in rows:
+        print(f"{first:<{widths[0]}}  {second:<{widths[1]}}  {third}")
 
 
 def _overrides_status() -> str:
